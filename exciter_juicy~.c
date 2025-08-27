@@ -1,9 +1,10 @@
-// exciter_juicy~.c (STEREO + Hardness upgrade)
-// - Stereo output (independent noise per ear for width)
-// - Hardness now adds extra noise layers + nonlinearity with gain compensation
-// - ADSR (noise-only, ms, velocity-aware)
-// - Click = 1-sample impulse OR DC (gated on note on/off, smoothed)
-// - Filter: LP/HP/BP per channel, 0–1 → 1Hz..~0.45*sr (log)
+// exciter_juicy~.c (STEREO + Hardness upgrade, stereo dsp fix)
+// - Stereo output (independent noise per ear for width).
+// - Hardness adds extra noise layers + nonlinearity with gain compensation.
+// - ADSR (noise-only, ms, velocity-aware).
+// - Click = 1-sample impulse OR DC (gated on note on/off, smoothed).
+// - Filter: LP/HP/BP per channel, 0–1 → 1Hz..~0.45*sr (log).
+
 #include "m_pd.h"
 #include <math.h>
 #include <stdlib.h>
@@ -13,7 +14,6 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-// Forward-declare class pointer
 static t_class* exciter_juicy_tilde_class;
 
 // ---------------- RNG (xorshift32) ----------------
@@ -25,9 +25,7 @@ static inline float rng32_nextf(rng32_t* r){
 }
 
 // ---------------- State Variable Filter (Chamberlin) -----------
-typedef struct {
-    float lp, bp, f, q; int mode; // 0 LP, 1 HP, 2 BP
-} svf_t;
+typedef struct { float lp, bp, f, q; int mode; } svf_t; // 0 LP, 1 HP, 2 BP
 static inline void svf_init(svf_t* s){ s->lp=s->bp=0.f; s->f=0.f; s->q=0.707f; s->mode=0; }
 static inline void svf_set_mode(svf_t* s, int mode){ s->mode=mode; }
 static inline void svf_set_cut(svf_t* s, float hz, float sr){
@@ -85,7 +83,6 @@ static inline float adsr_tick(adsr_t* e){
             } break;
         case ENV_DECAY:
             e->value += e->inc;
-            // Correct comparator so decay respects its ms
             if( (e->inc>=0.f && e->value>=e->target) || (e->inc<0.f && e->value<=e->target) ){
                 e->value=e->target; e->stage=ENV_SUSTAIN; e->inc=0.f;
             } break;
@@ -116,8 +113,8 @@ typedef struct _exciter_juicy_tilde {
     // filter per ear
     svf_t svfL, svfR; int filter_mode;
 
-    // internal pre-emphasis LP state for anti-sparse hi layer (per ear)
-    float n_lpL, n_lpR; float n_lp_a; // coeff for LP (used to derive high layer)
+    // pre-emphasis LP state for high-detail layer
+    float n_lpL, n_lpR; float n_lp_a;
 
     // click/DC
     int click_is_dc, gate; float velocity01;
@@ -128,7 +125,6 @@ typedef struct _exciter_juicy_tilde {
 // helpers
 static inline float clamp01(float v){ return v<0.f?0.f:(v>1.f?1.f:v); }
 static inline float mixf(float a,float b,float t){ return a + t*(b-a); }
-// normalized tanh shaper with makeup so output stays ~unity at max
 static inline float tanh_norm(float x, float drive){
     float d = (drive<1.f?1.f:drive);
     float y = tanhf(d*x);
@@ -155,7 +151,6 @@ static t_int* exciter_juicy_tilde_perform(t_int* w){
         float hardness   = clamp01(smooth_tick(&x->hardness_s,   x->hardness_t));
         float fnorm      = clamp01(smooth_tick(&x->filter_norm_s,x->filter_norm_t));
 
-        // cutoff mapping (log) shared; applied per-ear
         float fmin=1.f, fmax=0.45f*sr;
         float cutoff = expf(logf(fmin) + (logf(fmax)-logf(fmin))*fnorm);
         if(cutoff<1.f) cutoff=1.f; if(cutoff>fmax) cutoff=fmax;
@@ -164,19 +159,15 @@ static t_int* exciter_juicy_tilde_perform(t_int* w){
         x->svfL.q = x->svfR.q = 0.707f;
         x->svfL.mode = x->svfR.mode = x->filter_mode;
 
-        // ADSR updates
         x->env.sustain   = clamp01(x->sus_t);
         x->env.attack_ms = (x->atk_ms_t<0?0:x->atk_ms_t);
         x->env.decay_ms  = (x->dec_ms_t<0?0:x->dec_ms_t);
         x->env.release_ms= (x->rel_ms_t<0?0:x->rel_ms_t);
-        float env = adsr_tick(&x->env); // vel applied
+        float env = adsr_tick(&x->env);
 
-        // independent base noise per ear
         float nL = rng32_nextf(&x->rngL);
         float nR = rng32_nextf(&x->rngR);
 
-        // --- Hardness layers ---
-        // Layer A: anti-sparse (fold + signed square), per ear
         float foldedL = 2.f*fabsf(nL)-1.f;
         float foldedR = 2.f*fabsf(nR)-1.f;
         float sqL = (nL>=0.f? nL*nL : -(nL*nL));
@@ -184,28 +175,22 @@ static t_int* exciter_juicy_tilde_perform(t_int* w){
         float antiL = 0.5f*foldedL + 0.5f*sqL;
         float antiR = 0.5f*foldedR + 0.5f*sqR;
 
-        // Layer B: high-detail (pre-emphasis). lp ~1kHz, hi = n - lp(n)
         float a = x->n_lp_a;
         x->n_lpL += a * (nL - x->n_lpL);
         x->n_lpR += a * (nR - x->n_lpR);
         float hiL = nL - x->n_lpL;
         float hiR = nR - x->n_lpR;
 
-        // Mix base + layers by hardness
-        // hardness=0 → just base; hardness=1 → base + strong anti/hi
         float denseL = nL + hardness*(0.6f*antiL + 0.4f*hiL);
         float denseR = nR + hardness*(0.6f*antiR + 0.4f*hiR);
 
-        // Nonlinearity with gain comp; drive grows with hardness
         float drive = 1.f + 4.f*hardness; // 1..5
         float shapedL = tanh_norm(denseL, drive);
         float shapedR = tanh_norm(denseR, drive);
 
-        // Scale by envelope and noise gain
         float noiseL = noise_gain * env * shapedL;
         float noiseR = noise_gain * env * shapedR;
 
-        // click/DC (mono source applied equally to both ears)
         float click_dc = 0.f;
         if(x->click_is_dc){
             x->dc_target = (x->gate? click_vol : 0.f);
@@ -226,7 +211,6 @@ static void exciter_juicy_tilde_dsp(t_exciter_juicy_tilde* x, t_signal** sp){
     x->sr = sp[0]->s_sr>0? sp[0]->s_sr : 48000.f;
     adsr_init(&x->env, x->sr); x->env.vel_scale = x->velocity01;
     svf_init(&x->svfL); svf_init(&x->svfR);
-    // pre-emphasis LP coeff for ~1 kHz corner: a = 1-exp(-2*pi*fc/sr)
     float fc = 1000.f;
     x->n_lp_a = 1.f - expf(-2.f*(float)M_PI*fc / x->sr);
     x->n_lpL = x->n_lpR = 0.f;
@@ -236,7 +220,11 @@ static void exciter_juicy_tilde_dsp(t_exciter_juicy_tilde* x, t_signal** sp){
     smooth_set_tau(&x->filter_norm_s,10.f,x->sr);
     smooth_set_tau(&x->hardness_s,10.f,x->sr);
     smooth_set_tau(&x->dc_s,5.f,x->sr);
-    dsp_add(exciter_juicy_tilde_perform,4,x,sp[0]->s_n,sp[0]->s_vec,sp[1]->s_vec);
+
+    // IMPORTANT: because we used CLASS_MAINSIGNALIN, Pd gives us one signal inlet.
+    // So the signal vector order is: [in0], [out0], [out1].
+    // Wire our outs to sp[1] (L) and sp[2] (R).
+    dsp_add(exciter_juicy_tilde_perform,4,x,sp[0]->s_n,sp[1]->s_vec,sp[2]->s_vec);
 }
 
 // messages
@@ -311,7 +299,6 @@ static void* exciter_juicy_tilde_new(void){
 }
 static void exciter_juicy_tilde_free(t_exciter_juicy_tilde* x){ (void)x; }
 
-// setup
 void exciter_juicy_tilde_setup(void){
     t_class* c = class_new(gensym("exciter_juicy~"),
         (t_newmethod)exciter_juicy_tilde_new,
