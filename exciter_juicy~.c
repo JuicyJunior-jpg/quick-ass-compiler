@@ -50,6 +50,9 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+
+// Forward-declare class pointer early so new() can use it
+static t_class* exciter_juicy_tilde_class;
 // ---------------- RNG (fast, per-instance xorshift32) ----------------
 typedef struct {
     unsigned int state;
