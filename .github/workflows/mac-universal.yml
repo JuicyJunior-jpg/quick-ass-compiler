@@ -1,4 +1,4 @@
-name: build-pd-external
+name: build-mac-universal-pd-external
 
 on:
   push:
@@ -6,32 +6,29 @@ on:
   pull_request:
 
 jobs:
-  build-macos:
+  mac-universal:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build macOS .pd_darwin
-        run: |
-          clang -O3 -DPD -std=c99 -fPIC -shared \
-            -I/Applications/Pd.app/Contents/Resources/src \
-            -o exciter_juicy~.pd_darwin exciter_juicy~.c
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-pd-darwin
-          path: exciter_juicy~.pd_darwin
 
-  build-linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y puredata-dev
-      - name: Build Linux .pd_linux
+      - name: Fetch Pure Data headers
         run: |
-          clang -O3 -DPD -std=c99 -fPIC -shared \
-            -I/usr/include/pd \
-            -o exciter_juicy~.pd_linux exciter_juicy~.c -lm
-      - uses: actions/upload-artifact@v4
+          git clone --depth 1 https://github.com/pure-data/pure-data pd-src
+          test -f pd-src/src/m_pd.h
+
+      - name: Build universal .pd_darwin (arm64 + x86_64)
+        run: |
+          clang -O3 -DPD -std=c99 \
+            -arch x86_64 -arch arm64 \
+            -mmacosx-version-min=10.13 \
+            -I"$GITHUB_WORKSPACE/pd-src/src" \
+            -bundle -undefined dynamic_lookup \
+            exciter_juicy~.c \
+            -o exciter_juicy~.pd_darwin
+          lipo -info exciter_juicy~.pd_darwin
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: linux-pd-linux
-          path: exciter_juicy~.pd_linux
+          name: exciter_juicy-mac-universal
+          path: exciter_juicy~.pd_darwin
